@@ -5,6 +5,9 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	E "github.com/sagernet/sing/common/exceptions"
+	M "github.com/sagernet/sing/common/metadata"
+	"github.com/sagernet/sing/common/uot"
 	"io"
 	"net"
 	"strconv"
@@ -28,15 +31,17 @@ type Socks5 struct {
 
 type Socks5Option struct {
 	BasicOption
-	Name           string `proxy:"name"`
-	Server         string `proxy:"server"`
-	Port           int    `proxy:"port"`
-	UserName       string `proxy:"username,omitempty"`
-	Password       string `proxy:"password,omitempty"`
-	TLS            bool   `proxy:"tls,omitempty"`
-	UDP            bool   `proxy:"udp,omitempty"`
-	SkipCertVerify bool   `proxy:"skip-cert-verify,omitempty"`
-	Fingerprint    string `proxy:"fingerprint,omitempty"`
+	Name              string `proxy:"name"`
+	Server            string `proxy:"server"`
+	Port              int    `proxy:"port"`
+	UserName          string `proxy:"username,omitempty"`
+	Password          string `proxy:"password,omitempty"`
+	TLS               bool   `proxy:"tls,omitempty"`
+	UDP               bool   `proxy:"udp,omitempty"`
+	SkipCertVerify    bool   `proxy:"skip-cert-verify,omitempty"`
+	Fingerprint       string `proxy:"fingerprint,omitempty"`
+	UDPOverTCP        bool   `proxy:"udp-over-tcp,omitempty"`
+	UDPOverTCPVersion int    `proxy:"udp-over-tcp-version,omitempty"`
 }
 
 // StreamConnContext implements C.ProxyAdapter
@@ -59,6 +64,20 @@ func (ss *Socks5) StreamConnContext(ctx context.Context, c net.Conn, metadata *C
 	}
 	if _, err := socks5.ClientHandshake(c, serializesSocksAddr(metadata), socks5.CmdConnect, user); err != nil {
 		return nil, err
+	}
+	if metadata.NetWork == C.UDP && ss.option.UDPOverTCP {
+		switch ss.option.UDPOverTCPVersion {
+		case 0, uot.Version:
+			request := uot.Request{
+				IsConnect:   true,
+				Destination: uot.RequestDestination(uint8(ss.option.UDPOverTCPVersion)),
+			}
+			return uot.NewLazyConn(c, request), nil
+		case uot.LegacyVersion:
+			return uot.NewConn(c, uot.Request{}), nil
+		default:
+			return nil, E.New("unknown protocol version: ", ss.option.UDPOverTCPVersion)
+		}
 	}
 	return c, nil
 }
@@ -167,8 +186,23 @@ func (ss *Socks5) ListenPacketContext(ctx context.Context, metadata *C.Metadata,
 		// ASSOCIATE request arrived on terminates. RFC1928
 		pc.Close()
 	}()
-
+	if ss.option.UDPOverTCP {
+		destination := M.SocksaddrFromNet(metadata.UDPAddr())
+		switch ss.option.UDPOverTCPVersion {
+		case 0, uot.Version:
+			return newPacketConn(uot.NewLazyConn(c, uot.Request{Destination: destination}), ss), nil
+		case uot.LegacyVersion:
+			return newPacketConn(uot.NewConn(c, uot.Request{Destination: destination}), ss), nil
+		default:
+			return nil, E.New("unknown protocol version: ", ss.option.UDPOverTCPVersion)
+		}
+	}
 	return newPacketConn(&socksPacketConn{PacketConn: pc, rAddr: bindUDPAddr, tcpConn: c}, ss), nil
+}
+
+// SupportUOT implements C.ProxyAdapter
+func (ss *Socks5) SupportUOT() bool {
+	return ss.option.UDPOverTCP
 }
 
 func NewSocks5(option Socks5Option) (*Socks5, error) {
